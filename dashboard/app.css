@@ -144,3 +144,19 @@ ol.steps li::before {
   border: 1px solid var(--amber-deep); color: var(--amber); font-family: Georgia, serif; font-size: 14px;
 }
 .note { color: var(--muted); font-size: 13px; margin-top: 12px; }
+
+/* Model view */
+.model-strip a { cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
+.mtext { font-size: 14.5px; color: var(--paper-dim); margin: 0 0 11px; }
+.mtext b { color: var(--paper); }
+.model-grid { grid-template-columns: repeat(auto-fit, minmax(500px, 1fr)); align-items: start; }
+table.stats { min-width: 0; }
+table.stats thead th { position: static; }
+table.stats tbody td { cursor: default; padding: 8px 13px; font-size: 13.5px; }
+table.stats tbody tr:hover { background: transparent; }
+table.stats tr.ens td { color: var(--amber); font-weight: 620; }
+.scatter { width: 100%; height: auto; display: block; }
+.scatter .grid { stroke: var(--line-soft); stroke-width: 1; }
+.scatter .diag { stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 5 4; }
+.scatter .dots circle { fill: var(--amber); fill-opacity: 0.72; }
+.scatter .ax { fill: var(--muted); font-size: 11px; font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif; }

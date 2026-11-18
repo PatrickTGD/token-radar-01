@@ -30,6 +30,7 @@ function readHash() {
   const h = new URLSearchParams(location.hash.replace(/^#/, ''));
   return {
     p: h.get('p') || null,
+    model: h.get('model') === '1',
     q: h.get('q') || '',
     cat: h.get('cat') || '',
     chain: h.get('chain') || '',
@@ -42,6 +43,7 @@ function readHash() {
 function writeHash(st) {
   const h = new URLSearchParams();
   if (st.p) h.set('p', st.p);
+  if (st.model) h.set('model', '1');
   if (st.q) h.set('q', st.q);
   if (st.cat) h.set('cat', st.cat);
   if (st.chain) h.set('chain', st.chain);
@@ -68,12 +70,20 @@ function renderMast() {
   ]
     .map(([b, s]) => `<div class="stat"><b>${esc(b)}</b><span>${esc(s)}</span></div>`)
     .join('');
+  const v = D.validation;
   document.getElementById('modelStrip').innerHTML =
-    `<span class="formula">Implied value = TVL &times; <span class="fx">category multiple</span> &times; ` +
+    `<span class="formula">Implied value = blend of <span class="fx">peer multiples</span> and a <span class="fx">fitted size curve</span>, &times; ` +
     `<span class="fx">growth</span> &times; <span class="fx">maturity</span> &times; <span class="fx">breadth</span></span>` +
-    ` &nbsp;The multiple is the median market-cap/TVL of the category's traded protocols, shrunk toward the market-wide median of ` +
-    `<b>${D.global_multiple.toFixed(3)}&times;</b> when a category has few peers. Growth reads the 7-day TVL change, maturity the years run with no token, breadth the chain count. ` +
-    `Protocols whose token already trades are never on this board.`;
+    ` &nbsp;Two unrelated pricings of every protocol, averaged in log space; the spread between them is the value range on each detail page. ` +
+    `Backtested by leave-one-out on the ${v.comps} traded protocols: median error <b>${v.ensemble.median_ape_pct}%</b>, ` +
+    `<b>${v.ensemble.within_2x_pct}%</b> priced within 2&times; of the real market cap. ` +
+    `<a id="modelLink">How the model works, and its full backtest &rarr;</a>`;
+  document.getElementById('modelLink').addEventListener('click', () => {
+    state.p = null;
+    state.model = true;
+    writeHash(state);
+    render();
+  });
 }
 
 /* ---------------------------------------------------------------- board */
@@ -141,6 +151,7 @@ function renderBoard() {
   body.querySelectorAll('tr[data-slug]').forEach((tr) => {
     tr.addEventListener('click', () => {
       state.p = tr.getAttribute('data-slug');
+      state.model = false;
       writeHash(state);
       render();
     });
@@ -195,15 +206,112 @@ function renderDetail(r) {
     factorRow('Growth adjustment', m.growth_factor.toFixed(3) + '×', `From the 7-day TVL change of ${ch === null ? '0% (not reported)' : ch}, weighted at half strength and clamped.`, ((m.growth_factor - 0.7) / 0.8) * 100) +
     factorRow('Maturity adjustment', m.maturity_factor.toFixed(3) + '×', `${age} run with no token, at +6% a year up to six years.`, ((m.maturity_factor - 1) / 0.36) * 100) +
     factorRow('Breadth adjustment', m.breadth_factor.toFixed(3) + '×', `Live on ${r.chains.length} chain${r.chains.length === 1 ? '' : 's'}, at +2% per extra chain up to five.`, ((m.breadth_factor - 1) / 0.1) * 100) +
+    `<div class="kv"><span>Peer-multiple price, before adjustments</span><b>${money(m.comp_value_usd)}</b></div>` +
+    factorRow(
+      `Size-curve multiple — fitted, not peered`,
+      m.curve_multiple.toFixed(3) + '×',
+      `The fitted curve log(market cap) = ${D.validation.curve_intercept.toFixed(2)} + ${D.validation.curve_slope.toFixed(2)} &times; log(TVL)` +
+        (m.curve_category_comps >= 8 ? `, with this category's own intercept from its ${m.curve_category_comps} traded peers.` : `, on the market-wide line (this category has ${m.curve_category_comps} traded peers, too few for its own intercept).`),
+      (m.curve_multiple / 2) * 100,
+    ) +
+    `<div class="kv"><span>Size-curve price, before adjustments</span><b>${money(m.curve_value_usd)}</b></div>` +
     `<div class="total"><span>Implied value</span><b>${money(r.implied_value_usd)}</b></div>` +
-    `<p class="note">Implied value is what a token would be worth if this record stayed as it is — the radar's own claim, not a forecast of a launch.</p>` +
+    `<div class="kv"><span>Range across the two methods</span><b>${money(m.value_low_usd)} – ${money(m.value_high_usd)}</b></div>` +
+    `<p class="note">The blended value is the geometric mean of the two prices, moved by the three adjustments. The range is the two prices themselves, adjusted the same way: narrow where the methods agree, wide where they fight. Implied value is what a token would be worth if this record stayed as it is — the radar's own claim, not a forecast of a launch.</p>` +
     `</div>` +
-    `<div class="card"><h3>Farm plan</h3><ol class="steps">` +
+    `<div class="card"><h3>Farm plan</h3>` +
+    `<div class="kv"><span>Plan cost — fees, gas, interest</span><b>about $${r.plan.fee_usd}</b></div>` +
+    `<div class="kv"><span>Capital the plan puts to work</span><b>$${r.plan.capital_usd}</b></div>` +
+    `<div class="kv"><span>Your time</span><b>${r.plan.minutes} minutes over ${r.plan.weeks} weeks</b></div>` +
+    `<ol class="steps">` +
     r.farm_steps.map((s) => `<li>${esc(s)}</li>`).join('') +
     `</ol><p class="note">Costs and times are approximate, in US dollars, at the snapshot date. Protocols are risky: never farm with funds you cannot afford to lose.</p></div>` +
     `</div>`;
   document.getElementById('backLink').addEventListener('click', () => {
     state.p = null;
+    writeHash(state);
+    render();
+  });
+}
+
+/* ---------------------------------------------------------------- model view */
+
+/** The fitted-versus-actual scatter as one inline SVG: log-log, one point per traded protocol. */
+function scatterSvg() {
+  const pts = D.validation.scatter;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const [x, y] of pts) {
+    lo = Math.min(lo, x, y);
+    hi = Math.max(hi, x, y);
+  }
+  lo = Math.floor(lo);
+  hi = Math.ceil(hi);
+  const W = 560;
+  const H = 420;
+  const pad = 44;
+  const sx = (v) => pad + ((v - lo) / (hi - lo)) * (W - pad - 12);
+  const sy = (v) => H - pad - ((v - lo) / (hi - lo)) * (H - pad - 12);
+  let g = '';
+  for (let v = lo; v <= hi; v++) {
+    const label = v >= 9 ? `$${Math.round(10 ** (v - 9))}B` : v >= 6 ? `$${Math.round(10 ** (v - 6))}M` : `$${Math.round(10 ** (v - 3))}K`;
+    g += `<line x1="${sx(v)}" y1="${sy(lo)}" x2="${sx(v)}" y2="${sy(hi)}" class="grid"/>` +
+      `<line x1="${sx(lo)}" y1="${sy(v)}" x2="${sx(hi)}" y2="${sy(v)}" class="grid"/>` +
+      `<text x="${sx(v)}" y="${H - pad + 18}" class="ax">${label}</text>` +
+      `<text x="${pad - 8}" y="${sy(v) + 4}" class="ax" text-anchor="end">${label}</text>`;
+  }
+  const dots = pts.map(([x, y]) => `<circle cx="${sx(x).toFixed(1)}" cy="${sy(y).toFixed(1)}" r="3"/>`).join('');
+  return (
+    `<svg viewBox="0 0 ${W} ${H}" class="scatter" role="img" aria-label="Fitted versus actual market caps of the traded protocols">` +
+    g +
+    `<line x1="${sx(lo)}" y1="${sy(lo)}" x2="${sx(hi)}" y2="${sy(hi)}" class="diag"/>` +
+    `<g class="dots">${dots}</g>` +
+    `<text x="${(W + pad) / 2}" y="${H - 6}" class="ax" text-anchor="middle">Actual market cap (log scale)</text>` +
+    `<text x="14" y="${(H - pad) / 2}" class="ax" text-anchor="middle" transform="rotate(-90 14 ${(H - pad) / 2})">Model's fitted value (log scale)</text>` +
+    `</svg>`
+  );
+}
+
+function statRow(label, s, bold) {
+  return `<tr${bold ? ' class="ens"' : ''}><td>${esc(label)}</td><td class="num">${s.median_ape_pct}%</td><td class="num">${s.within_2x_pct}%</td><td class="num">${s.median_ratio.toFixed(3)}</td></tr>`;
+}
+
+function renderModel() {
+  const v = D.validation;
+  const el = document.getElementById('modelView');
+  el.innerHTML =
+    `<a class="back" id="modelBack">&larr; Back to the board</a>` +
+    `<div class="detail-head"><h2>How the model works</h2><span class="slug">and how it scored on the only ground truth there is</span></div>` +
+    `<div class="grid model-grid">` +
+    `<div class="card"><h3>Two pricings, blended</h3>` +
+    `<p class="mtext">A protocol that records no token has no price, so the radar prices it twice, from the ${v.comps} protocols in the snapshot whose tokens do trade.</p>` +
+    `<p class="mtext"><b>Peer multiples.</b> In each category, take the median market-cap/TVL of the traded protocols (ratios winsorised to 0.01–10&times; first, so one micro-cap cannot set a category's price). A category with few peers is shrunk toward the market-wide median of ${D.global_multiple.toFixed(3)}&times;; one with none uses it outright. Price = TVL &times; the multiple.</p>` +
+    `<p class="mtext"><b>The size curve.</b> Fit one line through every traded protocol: log(market cap) = ${v.curve_intercept.toFixed(3)} + ${v.curve_slope.toFixed(3)} &times; log(TVL). A slope under 1 says big protocols carry less market cap per TVL dollar than small ones. A category with at least 8 traded peers gets its own intercept on that line, shrunk toward the market's. Price = the curve's value at the protocol's TVL.</p>` +
+    `<p class="mtext"><b>The blend.</b> The board's value is the geometric mean of the two prices — equal weight in log space — then three nudges from the protocol's own record: growth (its 7-day TVL change, half weight, clamped), maturity (+6% per year run with no token, up to six years), breadth (+2% per extra chain, up to five). The two prices, adjusted the same way, are printed on every detail page as the value range.</p>` +
+    `<p class="mtext">Nothing here is a list of names: the same code prices every protocol, and a protocol whose token already trades is never on the board.</p>` +
+    `</div>` +
+    `<div class="card"><h3>The backtest: leave-one-out</h3>` +
+    `<p class="mtext">Each of the ${v.comps} traded protocols was priced by the full model fitted <i>without it</i> — its category's median, the curve, the blend, its own record's nudges — and the price set against the market cap it actually carries. Median error is the median absolute miss; within 2&times; is the share priced between half and double the truth.</p>` +
+    `<table class="stats"><thead><tr><th>Method</th><th class="num">Median error</th><th class="num">Within 2&times;</th><th class="num">Median ratio</th></tr></thead><tbody>` +
+    statRow('Peer multiples alone', v.comps_only, false) +
+    statRow('Size curve alone', v.curve_only, false) +
+    statRow('The ensemble (this board)', v.ensemble, true) +
+    `</tbody></table>` +
+    `<p class="mtext">The curve alone is the most accurate single method here; the multiples alone run high (median ratio ${v.comps_only.median_ratio.toFixed(2)}). The ensemble is kept anyway, on purpose: the two methods fail on different protocols, the blend hedges both, and their disagreement is information the board shows as a range instead of hiding. Errors near 90% are what pricing an unlaunched token honestly looks like — TVL explains a protocol's scale, not its whole worth.</p>` +
+    `</div>` +
+    `<div class="card"><h3>Fitted versus actual</h3>` +
+    scatterSvg() +
+    `<p class="note">One point per traded protocol: its real market cap across, the full model's fitted value up, both on log scales. The dashed line is a perfect fit. Points above it are protocols the model prices rich; below it, cheap. This chart is the full fit on its own training set — the honest out-of-sample figures are the leave-one-out table.</p>` +
+    `</div>` +
+    `<div class="card"><h3>Category pricing lines</h3>` +
+    `<table class="stats"><thead><tr><th>Category</th><th class="num">Traded peers</th><th class="num">Multiple used</th><th>Curve</th></tr></thead><tbody>` +
+    D.categories.map((c) => `<tr><td>${esc(c.category)}</td><td class="num">${c.comps}</td><td class="num">${c.multiple.toFixed(3)}&times;</td><td>${c.curve_intercept ? 'own intercept' : 'market line'}</td></tr>`).join('') +
+    `</tbody></table>` +
+    `<p class="note">The multiple a category's pre-token protocols are priced at, and whether the size curve gives the category its own intercept (8 or more traded peers) or prices it on the market-wide line.</p>` +
+    `</div>` +
+    `</div>`;
+  document.getElementById('modelBack').addEventListener('click', () => {
+    state.model = false;
     writeHash(state);
     render();
   });
@@ -222,10 +330,15 @@ function syncControls() {
 function render() {
   syncControls();
   const detail = state.p ? bySlug.get(state.p) : undefined;
-  document.getElementById('boardView').hidden = detail !== undefined;
+  const showModel = detail === undefined && state.model;
+  document.getElementById('boardView').hidden = detail !== undefined || showModel;
   document.getElementById('detailView').hidden = detail === undefined;
+  document.getElementById('modelView').hidden = !showModel;
   if (detail !== undefined) {
     renderDetail(detail);
+    window.scrollTo(0, 0);
+  } else if (showModel) {
+    renderModel();
     window.scrollTo(0, 0);
   } else {
     renderBoard();
